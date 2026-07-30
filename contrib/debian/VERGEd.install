@@ -1,2 +1,2 @@
-debian/bin/VERGEd usr/bin
-src/VERGEd usr/lib/VERGE/
+usr/local/bin/verged usr/bin
+usr/local/bin/verge-cli usr/bin

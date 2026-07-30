@@ -1,0 +1,2326 @@
+// Copyright (c) 2009-2017 The Bitcoin Core developers
+// Copyright (c) 2018-2025 The Verge Core developers
+// Distributed under the MIT software license, see the accompanying
+// file COPYING or http://www.opensource.org/licenses/mit-license.php.
+
+#include <qt/vergegui.h>
+
+#include <qt/vergeunits.h>
+#include <qt/clientmodel.h>
+#include <qt/guiconstants.h>
+#include <qt/guiutil.h>
+#include <qt/modaloverlay.h>
+#include <qt/networkstyle.h>
+#include <qt/notificator.h>
+#include <qt/openuridialog.h>
+#include <qt/optionsdialog.h>
+#include <qt/optionsmodel.h>
+#include <qt/platformstyle.h>
+#include <qt/rpcconsole.h>
+#include <qt/utilitydialog.h>
+
+#ifdef ENABLE_WALLET
+#include <qt/walletframe.h>
+#include <qt/walletmodel.h>
+#include <qt/walletview.h>
+#endif // ENABLE_WALLET
+
+#ifdef Q_OS_MAC
+#include <qt/macdockiconhandler.h>
+#endif
+
+#include <chainparams.h>
+#include <init.h>
+#include <interfaces/handler.h>
+#include <interfaces/node.h>
+#include <ui_interface.h>
+#include <util/system.h>
+#include <chain.h>
+
+#include <algorithm>
+#include <cmath>
+#include <iostream>
+
+#include <QAction>
+#include <QActionGroup>
+#include <QApplication>
+#include <QColor>
+#include <QComboBox>
+#include <QDateTime>
+#include <QDragEnterEvent>
+#include <QFontDatabase>
+#include <QGraphicsDropShadowEffect>
+#include <QGraphicsOpacityEffect>
+#include <QGuiApplication>
+#include <QHBoxLayout>
+#include <QDialogButtonBox>
+#include <QListWidget>
+#include <QMenuBar>
+#include <QMouseEvent>
+#include <QMessageBox>
+#include <QMimeData>
+#include <QPainter>
+#include <QPainterPath>
+#include <QPropertyAnimation>
+#include <QPushButton>
+#include <QProgressDialog>
+#include <QEasingCurve>
+#include <QSettings>
+#include <QShortcut>
+#include <QStackedWidget>
+#include <QStatusBar>
+#include <QStyle>
+#include <QScreen>
+#include <QTimer>
+#include <QToolButton>
+#include <QToolBar>
+
+#if QT_VERSION < 0x050000
+#include <QTextDocument>
+#include <QUrl>
+#else
+#include <QUrlQuery>
+#endif
+
+const std::string VERGEGUI::DEFAULT_UIPLATFORM =
+#if defined(Q_OS_MAC)
+        "macosx"
+#elif defined(Q_OS_WIN)
+        "windows"
+#else
+        "other"
+#endif
+        ;
+
+namespace {
+static const char* kGuiAppName = "Verge";
+
+bool IsCountableSmsgPeer(const CNodeStats& stats)
+{
+    return stats.fSmsgValidatedRelay && !stats.fDisconnect;
+}
+
+static void RefreshWidgetStyle(QWidget* widget)
+{
+    if (!widget) {
+        return;
+    }
+    widget->style()->unpolish(widget);
+    widget->style()->polish(widget);
+    widget->update();
+}
+
+class HoverGlowFilter : public QObject
+{
+public:
+    HoverGlowFilter(QGraphicsDropShadowEffect* effect,
+                    const QColor& baseColor,
+                    const QColor& hoverColor,
+                    qreal baseBlur,
+                    qreal hoverBlur,
+                    const QPointF& baseOffset,
+                    const QPointF& hoverOffset,
+                    QObject* parent) :
+        QObject(parent),
+        m_effect(effect),
+        m_baseColor(baseColor),
+        m_hoverColor(hoverColor),
+        m_baseBlur(baseBlur),
+        m_hoverBlur(hoverBlur),
+        m_baseOffset(baseOffset),
+        m_hoverOffset(hoverOffset),
+        m_blurAnimation(new QPropertyAnimation(effect, "blurRadius", this)),
+        m_colorAnimation(new QPropertyAnimation(effect, "color", this)),
+        m_offsetAnimation(new QPropertyAnimation(effect, "offset", this))
+    {
+        m_blurAnimation->setDuration(170);
+        m_blurAnimation->setEasingCurve(QEasingCurve::OutCubic);
+        m_colorAnimation->setDuration(170);
+        m_colorAnimation->setEasingCurve(QEasingCurve::OutCubic);
+        m_offsetAnimation->setDuration(170);
+        m_offsetAnimation->setEasingCurve(QEasingCurve::OutCubic);
+    }
+
+protected:
+    bool eventFilter(QObject* watched, QEvent* event) override
+    {
+        switch (event->type()) {
+        case QEvent::Enter:
+        case QEvent::HoverEnter:
+        case QEvent::FocusIn:
+            animate(true);
+            break;
+        case QEvent::Leave:
+        case QEvent::HoverLeave:
+        case QEvent::FocusOut:
+            animate(false);
+            break;
+        default:
+            break;
+        }
+        return QObject::eventFilter(watched, event);
+    }
+
+private:
+    void animate(bool hovered)
+    {
+        if (!m_effect) {
+            return;
+        }
+
+        m_blurAnimation->stop();
+        m_blurAnimation->setStartValue(m_effect->blurRadius());
+        m_blurAnimation->setEndValue(hovered ? m_hoverBlur : m_baseBlur);
+        m_blurAnimation->start();
+
+        m_colorAnimation->stop();
+        m_colorAnimation->setStartValue(m_effect->color());
+        m_colorAnimation->setEndValue(hovered ? m_hoverColor : m_baseColor);
+        m_colorAnimation->start();
+
+        m_offsetAnimation->stop();
+        m_offsetAnimation->setStartValue(m_effect->offset());
+        m_offsetAnimation->setEndValue(hovered ? m_hoverOffset : m_baseOffset);
+        m_offsetAnimation->start();
+    }
+
+    QGraphicsDropShadowEffect* m_effect;
+    QColor m_baseColor;
+    QColor m_hoverColor;
+    qreal m_baseBlur;
+    qreal m_hoverBlur;
+    QPointF m_baseOffset;
+    QPointF m_hoverOffset;
+    QPropertyAnimation* m_blurAnimation;
+    QPropertyAnimation* m_colorAnimation;
+    QPropertyAnimation* m_offsetAnimation;
+};
+
+static void InstallHoverGlow(QWidget* widget,
+                             const QColor& baseColor,
+                             const QColor& hoverColor,
+                             qreal baseBlur,
+                             qreal hoverBlur,
+                             const QPointF& baseOffset,
+                             const QPointF& hoverOffset)
+{
+    Q_UNUSED(widget);
+    Q_UNUSED(baseColor);
+    Q_UNUSED(hoverColor);
+    Q_UNUSED(baseBlur);
+    Q_UNUSED(hoverBlur);
+    Q_UNUSED(baseOffset);
+    Q_UNUSED(hoverOffset);
+}
+
+static void AnimateWidgetOpacity(QWidget* widget, int duration)
+{
+    Q_UNUSED(duration);
+    if (widget) {
+        widget->setProperty("entranceAnimationDone", true);
+    }
+}
+
+static int ConnectionSignalBarsForPeerCount(int peerCount)
+{
+    return qBound(0, peerCount, 5);
+}
+
+static QPixmap CreateConnectionSignalBarsPixmap(int litBars, const QColor& activeColor, const QColor& inactiveColor)
+{
+    const int width = 22;
+    const int height = 19;
+    const int bottomInset = 1;
+    const int leftInset = 1;
+    const int barWidth = 3;
+    const int gap = 1;
+    const int barHeights[5] = {4, 7, 10, 13, 16};
+
+    QPixmap pixmap(width, height);
+    pixmap.fill(Qt::transparent);
+
+    QPainter painter(&pixmap);
+    painter.setRenderHint(QPainter::Antialiasing, true);
+    painter.setPen(Qt::NoPen);
+
+    for (int i = 0; i < 5; ++i) {
+        const QColor color = i < litBars ? activeColor : inactiveColor;
+        const int barHeight = barHeights[i];
+        const int x = leftInset + (i * (barWidth + gap));
+        const int y = height - bottomInset - barHeight;
+
+        painter.setBrush(color);
+        painter.drawRoundedRect(QRectF(x, y, barWidth, barHeight), 1.0, 1.0);
+    }
+
+    return pixmap;
+}
+
+static QPixmap CreateChatBubblePixmap(const QColor& bubbleColor)
+{
+    const int width = 20;
+    const int height = 18;
+    QPixmap pixmap(width, height);
+    pixmap.fill(Qt::transparent);
+
+    QPainter painter(&pixmap);
+    painter.setRenderHint(QPainter::Antialiasing, true);
+    painter.setPen(Qt::NoPen);
+    painter.setBrush(bubbleColor);
+    painter.drawRoundedRect(QRectF(2.0, 2.0, 15.0, 11.0), 5.0, 5.0);
+
+    QPainterPath tail;
+    tail.moveTo(7.0, 12.0);
+    tail.lineTo(5.0, 16.0);
+    tail.lineTo(11.0, 12.0);
+    tail.closeSubpath();
+    painter.drawPath(tail);
+
+    QColor highlight = Qt::white;
+    highlight.setAlpha(180);
+    painter.setBrush(highlight);
+    painter.drawEllipse(QPointF(6.5, 7.5), 1.1, 1.1);
+    painter.drawEllipse(QPointF(10.0, 7.5), 1.1, 1.1);
+    painter.drawEllipse(QPointF(13.5, 7.5), 1.1, 1.1);
+
+    return pixmap;
+}
+
+static QPixmap CreateSyncedCheckPixmap(const QColor& checkColor)
+{
+    const int size = 18;
+    QPixmap pixmap(size, size);
+    pixmap.fill(Qt::transparent);
+
+    QPainter painter(&pixmap);
+    painter.setRenderHint(QPainter::Antialiasing, true);
+
+    QPen pen(checkColor);
+    pen.setWidthF(2.6);
+    pen.setCapStyle(Qt::RoundCap);
+    pen.setJoinStyle(Qt::RoundJoin);
+    painter.setPen(pen);
+
+    QPainterPath path;
+    path.moveTo(3.5, 9.5);
+    path.lineTo(7.2, 13.2);
+    path.lineTo(14.8, 5.4);
+    painter.drawPath(path);
+
+    return pixmap;
+}
+
+static QPixmap CreateSyncSpinnerPixmap(int frame, const QColor& accentColor, const QColor& baseColor)
+{
+    const int size = 18;
+    const qreal segmentWidth = 2.4;
+    const qreal segmentLength = 4.8;
+    const qreal segmentRadius = 5.0;
+
+    QPixmap pixmap(size, size);
+    pixmap.fill(Qt::transparent);
+
+    QPainter painter(&pixmap);
+    painter.setRenderHint(QPainter::Antialiasing, true);
+    painter.translate(size / 2.0, size / 2.0);
+    painter.setPen(Qt::NoPen);
+
+    auto blendChannel = [](int from, int to, qreal amount) {
+        return static_cast<int>(from + (to - from) * amount);
+    };
+
+    const int normalizedFrame = ((frame % SPINNER_FRAMES) + SPINNER_FRAMES) % SPINNER_FRAMES;
+    for (int i = 0; i < SPINNER_FRAMES; ++i) {
+        const int phase = (i - normalizedFrame + SPINNER_FRAMES) % SPINNER_FRAMES;
+        const qreal blend = std::pow(1.0 - (static_cast<qreal>(phase) / SPINNER_FRAMES), 1.55);
+
+        QColor segmentColor(
+            blendChannel(baseColor.red(), accentColor.red(), blend),
+            blendChannel(baseColor.green(), accentColor.green(), blend),
+            blendChannel(baseColor.blue(), accentColor.blue(), blend),
+            blendChannel(58, 255, blend));
+
+        painter.save();
+        painter.rotate((360.0 / SPINNER_FRAMES) * i);
+        painter.setBrush(segmentColor);
+        painter.drawRoundedRect(QRectF(segmentRadius, -segmentWidth / 2.0, segmentLength, segmentWidth),
+                                segmentWidth / 2.0, segmentWidth / 2.0);
+        painter.restore();
+    }
+
+    return pixmap;
+}
+}
+
+VERGEGUI::VERGEGUI(interfaces::Node& node, const PlatformStyle *_platformStyle, const NetworkStyle *networkStyle, QWidget *parent) :
+    QMainWindow(parent),
+    enableWallet(false),
+    m_node(node),
+    clientModel(0),
+    walletFrame(0),
+    unitDisplayControl(0),
+    labelWalletEncryptionIcon(0),
+    labelWalletHDStatusIcon(0),
+    labelProxyIcon(0),
+    labelSmsgIcon(0),
+    connectionsControl(0),
+    labelBlocksIcon(0),
+    progressBarLabel(0),
+    progressBar(0),
+    syncStatusCard(0),
+    proxyStatusChip(0),
+    networkStatusChip(0),
+    chainStatusChip(0),
+    proxyStatusLabel(0),
+    networkStatusLabel(0),
+    chainStatusLabel(0),
+    windowControls(0),
+    minimizeWindowButton(0),
+    maximizeWindowButton(0),
+    closeWindowButton(0),
+    progressDialog(0),
+    m_syncProgressBarTimer(0),
+    m_smsgStatusTimer(0),
+    m_syncProgressBarOffset(0),
+    m_hasAnimatedShell(false),
+    m_titleBarDragging(false),
+    appMenuBar(0),
+    appToolBar(0),
+    overviewAction(0),
+    historyAction(0),
+    quitAction(0),
+    sendCoinsAction(0),
+    messagesAction(0),
+    tradeAction(0),
+    gamesAction(0),
+    sendCoinsMenuAction(0),
+    usedSendingAddressesAction(0),
+    usedReceivingAddressesAction(0),
+    usedChatAddressesAction(0),
+    signMessageAction(0),
+    verifyMessageAction(0),
+    aboutAction(0),
+    receiveCoinsAction(0),
+    receiveCoinsMenuAction(0),
+    optionsAction(0),
+    toggleHideAction(0),
+    encryptWalletAction(0),
+    backupWalletAction(0),
+    changePassphraseAction(0),
+    aboutQtAction(0),
+    openRPCConsoleAction(0),
+    openAction(0),
+    showHelpMessageAction(0),
+    m_wallet_selector_label(0),
+    m_wallet_selector(0),
+    trayIcon(0),
+    trayIconMenu(0),
+    notificator(0),
+    rpcConsole(0),
+    helpMessageDialog(0),
+    modalOverlay(0),
+    spinnerFrame(0),
+    platformStyle(_platformStyle)
+{
+    setObjectName("VERGEGUI");
+
+    // Use a predictable startup size with preset profiles and a wide aspect ratio.
+    if (QScreen* const screen = QGuiApplication::primaryScreen()) {
+        QSettings settings;
+        const QString preset = settings.value("MainWindowStartupSizePreset", "medium").toString().toLower();
+        double areaRatio = 0.25;
+        if (preset == "small") areaRatio = 0.18;
+        else if (preset == "large") areaRatio = 0.33;
+
+        const QRect available = screen->availableGeometry();
+        const double targetArea = static_cast<double>(available.width()) * static_cast<double>(available.height()) * areaRatio;
+        const double aspectRatio = 1.6; // width / height
+        int targetWidth = static_cast<int>(std::sqrt(targetArea * aspectRatio));
+        int targetHeight = static_cast<int>(std::sqrt(targetArea / aspectRatio));
+
+#if defined(Q_OS_LINUX)
+        targetWidth = static_cast<int>(targetWidth * 1.25);
+#endif
+#if defined(Q_OS_MAC)
+        targetWidth = static_cast<int>(targetWidth * 1.40);
+#endif
+
+        targetWidth = qMin(targetWidth, static_cast<int>(available.width() * 0.95));
+        targetHeight = qMin(targetHeight, static_cast<int>(available.height() * 0.95));
+
+        resize(targetWidth, targetHeight);
+        move(available.center() - rect().center());
+    }
+
+    QString windowTitle = tr(kGuiAppName) + " - ";
+#ifdef ENABLE_WALLET
+    enableWallet = WalletModel::isWalletEnabled();
+#endif // ENABLE_WALLET
+    if(enableWallet)
+    {
+        windowTitle += tr("Wallet");
+    } else {
+        windowTitle += tr("Node");
+    }
+    windowTitle += " " + networkStyle->getTitleAddText();
+#ifndef Q_OS_MAC
+    QApplication::setWindowIcon(networkStyle->getTrayAndWindowIcon());
+    setWindowIcon(networkStyle->getTrayAndWindowIcon());
+#else
+    MacDockIconHandler::instance()->setIcon(networkStyle->getAppIcon());
+#endif
+    setWindowTitle(windowTitle);
+#ifndef Q_OS_MAC
+    setProperty("customChrome", true);
+    setWindowFlag(Qt::FramelessWindowHint, true);
+#endif
+
+#if defined(Q_OS_MAC) && QT_VERSION < 0x050000
+    // This property is not implemented in Qt 5. Setting it has no effect.
+    // A replacement API (QtMacUnifiedToolBar) is available in QtMacExtras.
+    setUnifiedTitleAndToolBarOnMac(true);
+#endif
+
+    rpcConsole = new RPCConsole(node, _platformStyle, 0);
+    helpMessageDialog = new HelpMessageDialog(node, this, false);
+#ifdef ENABLE_WALLET
+    if(enableWallet)
+    {
+        /** Create wallet frame and make it the central widget */
+        walletFrame = new WalletFrame(_platformStyle, this);
+        setCentralWidget(walletFrame);
+    } else
+#endif // ENABLE_WALLET
+    {
+        /* When compiled without wallet or -disablewallet is provided,
+         * the central widget is the rpc console.
+         */
+        setCentralWidget(rpcConsole);
+    }
+
+
+
+    const int id = QFontDatabase::addApplicationFont(":/fonts/montserrat");
+    const QStringList fontFamilies = QFontDatabase::applicationFontFamilies(id);
+    QFont appFont = QApplication::font();
+    if (!fontFamilies.isEmpty()) {
+        appFont.setFamily(fontFamilies.first());
+    }
+    const int defaultFontSize = qMax(8, appFont.pointSize() - 2);
+    appFont.setPointSize(defaultFontSize);
+    QApplication::setFont(appFont);
+
+    // Accept D&D of URIs
+    setAcceptDrops(true);
+
+    // Create actions for the toolbar, menu bar and tray/dock icon
+    // Needs walletFrame to be initialized
+    createActions();
+
+    // Create application menu bar
+    createMenuBar();
+
+    // Create the toolbars
+    createToolBars();
+
+    // Create system tray icon and notification
+    createTrayIcon(networkStyle);
+
+    // Create status bar
+    statusBar();
+    statusBar()->setObjectName("ShellStatusBar");
+    statusBar()->setMinimumHeight(52);
+
+    // Disable size grip because it looks ugly and nobody needs it
+    statusBar()->setSizeGripEnabled(false);
+
+    // Status bar notification icons
+    QFrame *frameBlocks = new QFrame();
+    frameBlocks->setObjectName("ShellStatusClusterCard");
+    frameBlocks->setContentsMargins(0,0,0,0);
+    frameBlocks->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Preferred);
+    QHBoxLayout *frameBlocksLayout = new QHBoxLayout(frameBlocks);
+    frameBlocksLayout->setContentsMargins(10, 6, 10, 6);
+    frameBlocksLayout->setSpacing(8);
+    unitDisplayControl = new UnitDisplayStatusBarControl(platformStyle);
+    unitDisplayControl->setObjectName("UnitDisplayStatusText");
+    labelWalletEncryptionIcon = new QLabel();
+    labelWalletEncryptionIcon->setObjectName("WalletStatusIcon");
+    labelWalletHDStatusIcon = new QLabel();
+    labelWalletHDStatusIcon->setObjectName("WalletStatusIcon");
+    labelProxyIcon = new QLabel();
+    labelProxyIcon->setObjectName("StatusChipIcon");
+    labelSmsgIcon = new QLabel();
+    labelSmsgIcon->setObjectName("StatusChipIcon");
+    labelSmsgIcon->setMinimumSize(20, 18);
+    connectionsControl = new GUIUtil::ClickableLabel();
+    connectionsControl->setObjectName("StatusChipIcon");
+    connectionsControl->setMinimumSize(22, 19);
+    labelBlocksIcon = new GUIUtil::ClickableLabel();
+    labelBlocksIcon->setObjectName("StatusChipIcon");
+
+    QWidget* walletStatusChip = nullptr;
+    if(enableWallet)
+    {
+        walletStatusChip = new QWidget(frameBlocks);
+        walletStatusChip->setObjectName("WalletSecurityChip");
+        QHBoxLayout* walletStatusLayout = new QHBoxLayout(walletStatusChip);
+        walletStatusLayout->setContentsMargins(10, 6, 10, 6);
+        walletStatusLayout->setSpacing(8);
+        walletStatusLayout->addWidget(unitDisplayControl);
+        walletStatusLayout->addWidget(labelWalletEncryptionIcon);
+        walletStatusLayout->addWidget(labelWalletHDStatusIcon);
+        frameBlocksLayout->addWidget(walletStatusChip);
+    }
+
+    proxyStatusChip = new QWidget(frameBlocks);
+    proxyStatusChip->setObjectName("ProxyStatusChip");
+    QHBoxLayout* proxyLayout = new QHBoxLayout(proxyStatusChip);
+    proxyLayout->setContentsMargins(10, 6, 10, 6);
+    proxyLayout->setSpacing(8);
+    proxyStatusLabel = new QLabel(tr("Proxy"));
+    proxyStatusLabel->setObjectName("StatusChipText");
+    proxyLayout->addWidget(labelProxyIcon);
+    proxyLayout->addWidget(proxyStatusLabel);
+    proxyStatusChip->hide();
+    frameBlocksLayout->addWidget(proxyStatusChip);
+
+    networkStatusChip = new QWidget(frameBlocks);
+    networkStatusChip->setObjectName("NetworkStatusChip");
+    QHBoxLayout* networkLayout = new QHBoxLayout(networkStatusChip);
+    networkLayout->setContentsMargins(10, 6, 10, 6);
+    networkLayout->setSpacing(8);
+    networkStatusLabel = new QLabel(tr("Searching"));
+    networkStatusLabel->setObjectName("StatusChipText");
+    networkLayout->addWidget(labelSmsgIcon);
+    networkLayout->addWidget(connectionsControl);
+    networkLayout->addWidget(networkStatusLabel);
+    frameBlocksLayout->addWidget(networkStatusChip);
+
+    chainStatusChip = new QWidget(frameBlocks);
+    chainStatusChip->setObjectName("ChainStatusChip");
+    QHBoxLayout* chainLayout = new QHBoxLayout(chainStatusChip);
+    chainLayout->setContentsMargins(10, 6, 10, 6);
+    chainLayout->setSpacing(8);
+    chainStatusLabel = new QLabel(tr("Launching"));
+    chainStatusLabel->setObjectName("StatusChipText");
+    chainLayout->addWidget(labelBlocksIcon);
+    chainLayout->addWidget(chainStatusLabel);
+    frameBlocksLayout->addWidget(chainStatusChip);
+
+    // Progress bar and label for blocks download
+    progressBarLabel = new QLabel();
+    progressBarLabel->setObjectName("SyncStatusLabel");
+    progressBarLabel->setVisible(false);
+    progressBar = new GUIUtil::ProgressBar();
+    progressBar->setObjectName("SyncStatusProgress");
+    progressBar->setAlignment(Qt::AlignCenter);
+    progressBar->setMinimumWidth(240);
+    progressBar->setVisible(false);
+    syncStatusCard = new QFrame();
+    syncStatusCard->setObjectName("ShellSyncStatusCard");
+    QHBoxLayout* syncStatusLayout = new QHBoxLayout(syncStatusCard);
+    syncStatusLayout->setContentsMargins(12, 6, 12, 6);
+    syncStatusLayout->setSpacing(10);
+    syncStatusLayout->addWidget(progressBarLabel);
+    syncStatusLayout->addWidget(progressBar, 1);
+    syncStatusCard->hide();
+
+    updateSyncProgressBarStyle();
+    updateSmsgStatusIcon();
+    m_syncProgressBarTimer = new QTimer(this);
+    m_syncProgressBarTimer->setInterval(50);
+    connect(m_syncProgressBarTimer, &QTimer::timeout, this, [this]() {
+        m_syncProgressBarOffset = (m_syncProgressBarOffset + 2) % 100;
+        spinnerFrame = (spinnerFrame + 1) % SPINNER_FRAMES;
+        updateSyncProgressBarStyle();
+        if (progressBar && progressBar->isVisible() && isVisible()) {
+            updateSyncSpinnerIcon();
+        }
+    });
+    m_smsgStatusTimer = new QTimer(this);
+    m_smsgStatusTimer->setInterval(5000);
+    connect(m_smsgStatusTimer, &QTimer::timeout, this, &VERGEGUI::updateSmsgStatusIcon);
+    m_smsgStatusTimer->start();
+
+    statusBar()->addWidget(syncStatusCard, 1);
+    statusBar()->addPermanentWidget(frameBlocks);
+
+    // Install event filter to be able to catch status tip events (QEvent::StatusTip)
+    this->installEventFilter(this);
+
+    // Initially wallet actions should be disabled
+    setWalletActionsEnabled(false);
+
+    // Subscribe to notifications from core
+    subscribeToCoreSignals();
+
+    connect(connectionsControl, SIGNAL(clicked(QPoint)), this, SLOT(showDebugWindowActivatePeers()));
+
+    modalOverlay = new ModalOverlay(this->centralWidget());
+#ifdef ENABLE_WALLET
+    if(enableWallet) {
+        connect(walletFrame, SIGNAL(requestedSyncWarningInfo()), this, SLOT(showModalOverlay()));
+        connect(labelBlocksIcon, SIGNAL(clicked(QPoint)), this, SLOT(showModalOverlay()));
+        connect(progressBar, SIGNAL(clicked(QPoint)), this, SLOT(showModalOverlay()));
+    }
+#endif
+
+    polishShellWidgets();
+
+}
+
+VERGEGUI::~VERGEGUI()
+{
+    // Unsubscribe from notifications from core
+    unsubscribeFromCoreSignals();
+
+    if(trayIcon) // Hide tray icon, as deleting will let it linger until quit (on Ubuntu)
+        trayIcon->hide();
+#ifdef Q_OS_MAC
+    delete appMenuBar;
+    MacDockIconHandler::cleanup();
+#endif
+
+    delete rpcConsole;
+}
+
+void VERGEGUI::createActions()
+{
+    QActionGroup *tabGroup = new QActionGroup(this);
+
+    overviewAction = new QAction(platformStyle->SingleColorIcon(":/icons/overview"), tr("&Overview"), this);
+    overviewAction->setStatusTip(tr("Show general overview of wallet"));
+    overviewAction->setToolTip(overviewAction->statusTip());
+    overviewAction->setCheckable(true);
+    overviewAction->setShortcut(QKeySequence(Qt::ALT | Qt::Key_1));
+    tabGroup->addAction(overviewAction);
+
+    sendCoinsAction = new QAction(platformStyle->SingleColorIcon(":/icons/send"), tr("&Send"), this);
+    sendCoinsAction->setStatusTip(tr("Send coins to a VERGE address"));
+    sendCoinsAction->setToolTip(sendCoinsAction->statusTip());
+    sendCoinsAction->setCheckable(true);
+    sendCoinsAction->setShortcut(QKeySequence(Qt::ALT | Qt::Key_2));
+    tabGroup->addAction(sendCoinsAction);
+
+    sendCoinsMenuAction = new QAction(platformStyle->TextColorIcon(":/icons/send"), sendCoinsAction->text(), this);
+    sendCoinsMenuAction->setStatusTip(sendCoinsAction->statusTip());
+    sendCoinsMenuAction->setToolTip(sendCoinsMenuAction->statusTip());
+
+    receiveCoinsAction = new QAction(platformStyle->SingleColorIcon(":/icons/receiving_addresses"), tr("&Addresses"), this);
+    receiveCoinsAction->setStatusTip(tr("Manage receiving addresses, get Qr codes for receiving XVG, and make new receiving addresses"));
+    receiveCoinsAction->setToolTip(receiveCoinsAction->statusTip());
+    receiveCoinsAction->setCheckable(true);
+    receiveCoinsAction->setShortcut(QKeySequence(Qt::ALT | Qt::Key_3));
+    tabGroup->addAction(receiveCoinsAction);
+
+    receiveCoinsMenuAction = new QAction(platformStyle->TextColorIcon(":/icons/receiving_addresses"), receiveCoinsAction->text(), this);
+    receiveCoinsMenuAction->setStatusTip(receiveCoinsAction->statusTip());
+    receiveCoinsMenuAction->setToolTip(receiveCoinsMenuAction->statusTip());
+
+    historyAction = new QAction(platformStyle->SingleColorIcon(":/icons/history"), tr("&Transactions"), this);
+    historyAction->setStatusTip(tr("Browse transaction history"));
+    historyAction->setToolTip(historyAction->statusTip());
+    historyAction->setCheckable(true);
+    historyAction->setShortcut(QKeySequence(Qt::ALT | Qt::Key_4));
+    tabGroup->addAction(historyAction);
+
+    messagesAction = new QAction(platformStyle->SingleColorIcon(":/icons/messages"), tr("&Messages"), this);
+    messagesAction->setStatusTip(tr("Read and send secure messages"));
+    messagesAction->setToolTip(messagesAction->statusTip());
+    messagesAction->setCheckable(true);
+    messagesAction->setShortcut(QKeySequence(Qt::ALT | Qt::Key_5));
+    tabGroup->addAction(messagesAction);
+
+    tradeAction = new QAction(platformStyle->SingleColorIcon(":/icons/trade"), tr("&Trade"), this);
+    tradeAction->setStatusTip(tr("Trade using the integrated StealthEX widget"));
+    tradeAction->setToolTip(tradeAction->statusTip());
+    tradeAction->setCheckable(true);
+    tradeAction->setShortcut(QKeySequence(Qt::ALT | Qt::Key_6));
+    tabGroup->addAction(tradeAction);
+
+    gamesAction = new QAction(platformStyle->SingleColorIcon(":/icons/games"), tr("&Games"), this);
+    gamesAction->setStatusTip(tr("Play built-in games"));
+    gamesAction->setToolTip(gamesAction->statusTip());
+    gamesAction->setCheckable(true);
+    gamesAction->setShortcut(QKeySequence(Qt::ALT | Qt::Key_7));
+    tabGroup->addAction(gamesAction);
+
+#ifdef ENABLE_WALLET
+    // These showNormalIfMinimized are needed because Send Coins and Receive Coins
+    // can be triggered from the tray menu, and need to show the GUI to be useful.
+    connect(overviewAction, SIGNAL(triggered(bool)), this, SLOT(showNormalIfMinimized()));
+    connect(overviewAction, SIGNAL(triggered(bool)), this, SLOT(gotoOverviewPage()));
+    connect(sendCoinsAction, SIGNAL(triggered(bool)), this, SLOT(showNormalIfMinimized()));
+    connect(sendCoinsAction, SIGNAL(triggered(bool)), this, SLOT(gotoSendCoinsPage()));
+    connect(sendCoinsMenuAction, SIGNAL(triggered(bool)), this, SLOT(showNormalIfMinimized()));
+    connect(sendCoinsMenuAction, SIGNAL(triggered(bool)), this, SLOT(gotoSendCoinsPage()));
+    connect(receiveCoinsAction, SIGNAL(triggered(bool)), this, SLOT(showNormalIfMinimized()));
+    connect(receiveCoinsAction, SIGNAL(triggered(bool)), this, SLOT(gotoReceiveCoinsPage()));
+    connect(receiveCoinsMenuAction, SIGNAL(triggered(bool)), this, SLOT(showNormalIfMinimized()));
+    connect(receiveCoinsMenuAction, SIGNAL(triggered(bool)), this, SLOT(gotoReceiveCoinsPage()));
+    connect(historyAction, SIGNAL(triggered(bool)), this, SLOT(showNormalIfMinimized()));
+    connect(historyAction, SIGNAL(triggered(bool)), this, SLOT(gotoHistoryPage()));
+    connect(messagesAction, SIGNAL(triggered(bool)), this, SLOT(showNormalIfMinimized()));
+    connect(messagesAction, SIGNAL(triggered(bool)), this, SLOT(gotoMessagesPage()));
+    connect(tradeAction, SIGNAL(triggered(bool)), this, SLOT(showNormalIfMinimized()));
+    connect(tradeAction, SIGNAL(triggered(bool)), this, SLOT(gotoTradePage()));
+    connect(gamesAction, SIGNAL(triggered(bool)), this, SLOT(showNormalIfMinimized()));
+    connect(gamesAction, SIGNAL(triggered(bool)), this, SLOT(gotoGamesPage()));
+#endif // ENABLE_WALLET
+
+    quitAction = new QAction(platformStyle->TextColorIcon(":/icons/quit"), tr("E&xit"), this);
+    quitAction->setStatusTip(tr("Quit application"));
+    quitAction->setShortcut(QKeySequence(Qt::CTRL | Qt::Key_Q));
+    quitAction->setMenuRole(QAction::QuitRole);
+    aboutAction = new QAction(platformStyle->TextColorIcon(":/icons/about"), tr("&About %1").arg(tr(kGuiAppName)), this);
+    aboutAction->setStatusTip(tr("Show information about %1").arg(tr(kGuiAppName)));
+    aboutAction->setMenuRole(QAction::AboutRole);
+    aboutAction->setEnabled(false);
+    aboutQtAction = new QAction(platformStyle->TextColorIcon(":/icons/about_qt"), tr("About &Qt"), this);
+    aboutQtAction->setStatusTip(tr("Show information about Qt"));
+    aboutQtAction->setMenuRole(QAction::AboutQtRole);
+    optionsAction = new QAction(platformStyle->TextColorIcon(":/icons/options"), tr("&Options..."), this);
+    optionsAction->setStatusTip(tr("Modify configuration options for %1").arg(tr(kGuiAppName)));
+    optionsAction->setMenuRole(QAction::PreferencesRole);
+    optionsAction->setEnabled(false);
+    toggleHideAction = new QAction(platformStyle->TextColorIcon(":/icons/about"), tr("&Show / Hide"), this);
+    toggleHideAction->setStatusTip(tr("Show or hide the main Window"));
+
+    encryptWalletAction = new QAction(platformStyle->TextColorIcon(":/icons/lock_closed"), tr("&Encrypt Wallet..."), this);
+    encryptWalletAction->setStatusTip(tr("Encrypt the private keys that belong to your wallet"));
+    encryptWalletAction->setCheckable(true);
+    backupWalletAction = new QAction(platformStyle->TextColorIcon(":/icons/filesave"), tr("&Backup Wallet..."), this);
+    backupWalletAction->setStatusTip(tr("Backup wallet to another location"));
+    changePassphraseAction = new QAction(platformStyle->TextColorIcon(":/icons/key"), tr("&Change Passphrase..."), this);
+    changePassphraseAction->setStatusTip(tr("Change the passphrase used for wallet encryption"));
+    signMessageAction = new QAction(platformStyle->TextColorIcon(":/icons/edit"), tr("Sign &message..."), this);
+    signMessageAction->setStatusTip(tr("Sign messages with your VERGE addresses to prove you own them"));
+    verifyMessageAction = new QAction(platformStyle->TextColorIcon(":/icons/verify"), tr("&Verify message..."), this);
+    verifyMessageAction->setStatusTip(tr("Verify messages to ensure they were signed with specified VERGE addresses"));
+
+    openRPCConsoleAction = new QAction(platformStyle->TextColorIcon(":/icons/debugwindow"), tr("&Debug window"), this);
+    openRPCConsoleAction->setStatusTip(tr("Open debugging and diagnostic console"));
+    // initially disable the debug window menu item
+    openRPCConsoleAction->setEnabled(false);
+
+    usedSendingAddressesAction = new QAction(platformStyle->TextColorIcon(":/icons/address-book"), tr("&Sending addresses..."), this);
+    usedSendingAddressesAction->setStatusTip(tr("Show the list of used sending addresses and labels"));
+    usedReceivingAddressesAction = new QAction(platformStyle->TextColorIcon(":/icons/address-book"), tr("&Receiving addresses..."), this);
+    usedReceivingAddressesAction->setStatusTip(tr("Show the list of used receiving addresses and labels"));
+    usedChatAddressesAction = new QAction(platformStyle->TextColorIcon(":/icons/address-book"), tr("&Chat addresses..."), this);
+    usedChatAddressesAction->setStatusTip(tr("Show local chat-enabled addresses, chatkeys, and QR payloads"));
+
+    openAction = new QAction(platformStyle->TextColorIcon(":/icons/open"), tr("Open &URI..."), this);
+    openAction->setStatusTip(tr("Open a verge: URI"));
+
+    showHelpMessageAction = new QAction(platformStyle->TextColorIcon(":/icons/info"), tr("&Command-line options"), this);
+    showHelpMessageAction->setMenuRole(QAction::NoRole);
+    showHelpMessageAction->setStatusTip(tr("Show the %1 help message to get a list with possible VERGE command-line options").arg(tr(kGuiAppName)));
+
+    connect(quitAction, SIGNAL(triggered()), qApp, SLOT(quit()));
+    connect(aboutAction, SIGNAL(triggered()), this, SLOT(aboutClicked()));
+    connect(aboutQtAction, SIGNAL(triggered()), this, SLOT(aboutQtClicked()));
+    connect(optionsAction, SIGNAL(triggered()), this, SLOT(optionsClicked()));
+    connect(toggleHideAction, SIGNAL(triggered()), this, SLOT(toggleHidden()));
+    connect(showHelpMessageAction, SIGNAL(triggered()), this, SLOT(showHelpMessageClicked()));
+    connect(openRPCConsoleAction, SIGNAL(triggered()), this, SLOT(showDebugWindow()));
+    // prevents an open debug window from becoming stuck/unusable on client shutdown
+    connect(quitAction, SIGNAL(triggered()), rpcConsole, SLOT(hide()));
+
+#ifdef ENABLE_WALLET
+    if(walletFrame)
+    {
+        connect(encryptWalletAction, SIGNAL(triggered(bool)), walletFrame, SLOT(encryptWallet(bool)));
+        connect(backupWalletAction, SIGNAL(triggered()), walletFrame, SLOT(backupWallet()));
+        connect(changePassphraseAction, SIGNAL(triggered()), walletFrame, SLOT(changePassphrase()));
+        connect(signMessageAction, SIGNAL(triggered(bool)), this, SLOT(gotoSignMessageTab()));
+        connect(verifyMessageAction, SIGNAL(triggered(bool)), this, SLOT(gotoVerifyMessageTab()));
+        connect(usedSendingAddressesAction, SIGNAL(triggered()), walletFrame, SLOT(usedSendingAddresses()));
+        connect(usedReceivingAddressesAction, SIGNAL(triggered()), walletFrame, SLOT(usedReceivingAddresses()));
+        connect(usedChatAddressesAction, SIGNAL(triggered()), walletFrame, SLOT(usedChatAddresses()));
+        connect(openAction, SIGNAL(triggered()), this, SLOT(openClicked()));
+    }
+#endif // ENABLE_WALLET
+
+    new QShortcut(QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_C), this, SLOT(showDebugWindowActivateConsole()));
+    new QShortcut(QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_D), this, SLOT(showDebugWindow()));
+}
+
+void VERGEGUI::createMenuBar()
+{
+#ifdef Q_OS_MAC
+    // Create a decoupled menu bar on Mac which stays even if the window is closed
+    appMenuBar = new QMenuBar();
+#elif !defined(Q_OS_MAC)
+    if (!appMenuBar) {
+        appMenuBar = new QMenuBar();
+        setMenuBar(appMenuBar);
+    }
+#endif
+
+    // Configure the menus
+    QMenu *file = appMenuBar->addMenu(tr("&File"));
+    if(walletFrame)
+    {
+        file->addAction(openAction);
+        file->addAction(backupWalletAction);
+        file->addAction(signMessageAction);
+        file->addAction(verifyMessageAction);
+        file->addSeparator();
+        file->addAction(usedSendingAddressesAction);
+        file->addAction(usedReceivingAddressesAction);
+        file->addAction(usedChatAddressesAction);
+        file->addSeparator();
+    }
+    file->addAction(quitAction);
+
+    QMenu *settings = appMenuBar->addMenu(tr("&Settings"));
+    if(walletFrame)
+    {
+        settings->addAction(encryptWalletAction);
+        settings->addAction(changePassphraseAction);
+        settings->addSeparator();
+    }
+    settings->addAction(optionsAction);
+
+    QMenu *help = appMenuBar->addMenu(tr("&Help"));
+    if(walletFrame)
+    {
+        help->addAction(openRPCConsoleAction);
+    }
+    help->addAction(showHelpMessageAction);
+    help->addSeparator();
+    help->addAction(aboutAction);
+    help->addAction(aboutQtAction);
+
+    createMainWindowChrome();
+}
+
+void VERGEGUI::createMainWindowChrome()
+{
+#ifdef Q_OS_MAC
+    return;
+#else
+    if (!appMenuBar || windowControls) {
+        return;
+    }
+
+    appMenuBar->installEventFilter(this);
+    appMenuBar->setMouseTracking(true);
+
+    windowControls = new QWidget(appMenuBar);
+    windowControls->setObjectName("ShellWindowControls");
+    QHBoxLayout* controlsLayout = new QHBoxLayout(windowControls);
+    controlsLayout->setContentsMargins(0, 0, 6, 0);
+    controlsLayout->setSpacing(4);
+
+    auto makeButton = [this](const char* objectName, QStyle::StandardPixmap icon, const QString& tooltip) {
+        QToolButton* button = new QToolButton(windowControls);
+        button->setObjectName(objectName);
+        button->setAutoRaise(true);
+        button->setIcon(style()->standardIcon(icon));
+        button->setToolTip(tooltip);
+        button->setFixedSize(34, 26);
+        return button;
+    };
+
+    minimizeWindowButton = makeButton("ShellWindowControlButton", QStyle::SP_TitleBarMinButton, tr("Minimize"));
+    maximizeWindowButton = makeButton("ShellWindowControlButton", QStyle::SP_TitleBarMaxButton, tr("Maximize"));
+    closeWindowButton = makeButton("ShellWindowCloseButton", QStyle::SP_TitleBarCloseButton, tr("Close"));
+
+    controlsLayout->addWidget(minimizeWindowButton);
+    controlsLayout->addWidget(maximizeWindowButton);
+    controlsLayout->addWidget(closeWindowButton);
+    appMenuBar->setCornerWidget(windowControls, Qt::TopRightCorner);
+
+    connect(minimizeWindowButton, &QToolButton::clicked, this, &QWidget::showMinimized);
+    connect(maximizeWindowButton, &QToolButton::clicked, this, [this]() {
+        if (isMaximized()) {
+            showNormal();
+        } else {
+            showMaximized();
+        }
+        updateMainWindowChromeButtons();
+    });
+    connect(closeWindowButton, &QToolButton::clicked, this, &QWidget::close);
+    updateMainWindowChromeButtons();
+#endif
+}
+
+void VERGEGUI::updateMainWindowChromeButtons()
+{
+    if (!maximizeWindowButton) {
+        return;
+    }
+
+    const bool maximized = isMaximized();
+    maximizeWindowButton->setIcon(style()->standardIcon(maximized ? QStyle::SP_TitleBarNormalButton : QStyle::SP_TitleBarMaxButton));
+    maximizeWindowButton->setToolTip(maximized ? tr("Restore") : tr("Maximize"));
+}
+
+void VERGEGUI::createToolBars()
+{
+    if(walletFrame)
+    {
+        QToolBar *toolbar = addToolBar(tr("Tabs toolbar"));
+        appToolBar = toolbar;
+        toolbar->setObjectName("ShellToolbar");
+        toolbar->setContextMenuPolicy(Qt::PreventContextMenu);
+        toolbar->setMovable(false);
+        toolbar->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+        toolbar->setIconSize(QSize(TOOLBAR_ICONSIZE, TOOLBAR_ICONSIZE));
+        toolbar->addAction(overviewAction);
+        toolbar->addAction(sendCoinsAction);
+        toolbar->addAction(receiveCoinsAction);
+        toolbar->addAction(historyAction);
+        toolbar->addAction(messagesAction);
+        toolbar->addAction(tradeAction);
+        toolbar->addAction(gamesAction);
+        overviewAction->setChecked(true);
+
+#ifdef ENABLE_WALLET
+        QWidget *spacer = new QWidget();
+        spacer->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
+        toolbar->addWidget(spacer);
+
+        m_wallet_selector = new QComboBox();
+        connect(m_wallet_selector, SIGNAL(currentIndexChanged(int)), this, SLOT(setCurrentWalletBySelectorIndex(int)));
+#endif
+    }
+}
+
+void VERGEGUI::polishShellWidgets()
+{
+    if (appToolBar) {
+        const QList<QAction*> navigationActions{overviewAction, sendCoinsAction, receiveCoinsAction, historyAction, messagesAction, tradeAction, gamesAction};
+        for (QAction* action : navigationActions) {
+            if (!action) {
+                continue;
+            }
+            if (QWidget* button = appToolBar->widgetForAction(action)) {
+                button->setObjectName("ShellNavButton");
+                InstallHoverGlow(button,
+                                 QColor(7, 12, 20, 0),
+                                 QColor(93, 169, 255, 130),
+                                 8.0,
+                                 24.0,
+                                 QPointF(0.0, 2.0),
+                                 QPointF(0.0, 8.0));
+            }
+        }
+    }
+
+    if (m_wallet_selector_label) {
+        m_wallet_selector_label->setObjectName("ShellWalletSelectorLabel");
+    }
+    if (m_wallet_selector) {
+        m_wallet_selector->setObjectName("ShellWalletSelector");
+    }
+
+    InstallHoverGlow(unitDisplayControl,
+                     QColor(3, 6, 12, 0),
+                     QColor(102, 170, 255, 88),
+                     6.0,
+                     18.0,
+                     QPointF(0.0, 2.0),
+                     QPointF(0.0, 6.0));
+    InstallHoverGlow(networkStatusChip,
+                     QColor(3, 6, 12, 0),
+                     QColor(43, 179, 138, 110),
+                     8.0,
+                     22.0,
+                     QPointF(0.0, 2.0),
+                     QPointF(0.0, 7.0));
+    InstallHoverGlow(chainStatusChip,
+                     QColor(3, 6, 12, 0),
+                     QColor(99, 159, 255, 116),
+                     8.0,
+                     22.0,
+                     QPointF(0.0, 2.0),
+                     QPointF(0.0, 7.0));
+    InstallHoverGlow(proxyStatusChip,
+                     QColor(3, 6, 12, 0),
+                     QColor(255, 189, 92, 96),
+                     8.0,
+                     20.0,
+                     QPointF(0.0, 2.0),
+                     QPointF(0.0, 6.0));
+
+    const QList<QPushButton*> pushButtons = findChildren<QPushButton*>();
+    for (QPushButton* button : pushButtons) {
+        const QString objectName = button->objectName();
+        if (objectName == "TransactionsExportButton" ||
+            objectName.endsWith("PrimaryButton") ||
+            objectName.endsWith("SecondaryButton") ||
+            objectName.endsWith("ActionButton")) {
+            InstallHoverGlow(button,
+                             QColor(3, 6, 12, 0),
+                             objectName.contains("Primary")
+                                 ? QColor(92, 169, 255, 104)
+                                 : QColor(98, 121, 164, 78),
+                             8.0,
+                             18.0,
+                             QPointF(0.0, 2.0),
+                             QPointF(0.0, 6.0));
+        }
+    }
+
+    const QList<QToolButton*> toolButtons = findChildren<QToolButton*>();
+    for (QToolButton* button : toolButtons) {
+        const QString objectName = button->objectName();
+        if (objectName == "SendEntryToolButton" ||
+            objectName == "SendEntryDeleteButton" ||
+            objectName == "SignVerifyIconButton") {
+            InstallHoverGlow(button,
+                             QColor(3, 6, 12, 0),
+                             objectName.contains("Delete")
+                                 ? QColor(198, 89, 107, 100)
+                                 : QColor(87, 145, 239, 92),
+                             6.0,
+                             16.0,
+                             QPointF(0.0, 2.0),
+                             QPointF(0.0, 5.0));
+        }
+    }
+}
+
+void VERGEGUI::setClientModel(ClientModel *_clientModel)
+{
+    this->clientModel = _clientModel;
+    if(_clientModel)
+    {
+        // Create system tray menu (or setup the dock menu) that late to prevent users from calling actions,
+        // while the client has not yet fully loaded
+        createTrayIconMenu();
+
+        // Keep up to date with client
+        updateNetworkState();
+        connect(_clientModel, SIGNAL(numConnectionsChanged(int)), this, SLOT(setNumConnections(int)));
+        connect(_clientModel, SIGNAL(networkActiveChanged(bool)), this, SLOT(setNetworkActive(bool)));
+
+        modalOverlay->setKnownBestHeight(_clientModel->getHeaderTipHeight(), QDateTime::fromSecsSinceEpoch(_clientModel->getHeaderTipTime()));
+        setNumBlocks(m_node.getNumBlocks(), QDateTime::fromSecsSinceEpoch(m_node.getLastBlockTime()), m_node.getVerificationProgress(), false);
+        connect(_clientModel, SIGNAL(numBlocksChanged(int,QDateTime,double,bool)), this, SLOT(setNumBlocks(int,QDateTime,double,bool)));
+
+        // Receive and report messages from client model
+        connect(_clientModel, SIGNAL(message(QString,QString,unsigned int)), this, SLOT(message(QString,QString,unsigned int)));
+
+        // Show progress dialog
+        connect(_clientModel, SIGNAL(showProgress(QString,int)), this, SLOT(showProgress(QString,int)));
+
+        rpcConsole->setClientModel(_clientModel);
+
+        updateProxyIcon();
+
+#ifdef ENABLE_WALLET
+        if(walletFrame)
+        {
+            walletFrame->setClientModel(_clientModel);
+        }
+#endif // ENABLE_WALLET
+        unitDisplayControl->setOptionsModel(_clientModel->getOptionsModel());
+        
+        OptionsModel* optionsModel = _clientModel->getOptionsModel();
+        if(optionsModel)
+        {
+            // be aware of the tray icon disable state change reported by the OptionsModel object.
+            connect(optionsModel,SIGNAL(hideTrayIconChanged(bool)),this,SLOT(setTrayIconVisible(bool)));
+        
+            // initialize the disable state of the tray icon with the current value in the model.
+            setTrayIconVisible(optionsModel->getHideTrayIcon());
+        }
+    } else {
+        // Disable possibility to show main window via action
+        toggleHideAction->setEnabled(false);
+        if(trayIconMenu)
+        {
+            // Disable context menu on tray icon
+            trayIconMenu->clear();
+        }
+        // Propagate cleared model to child objects
+        rpcConsole->setClientModel(nullptr);
+#ifdef ENABLE_WALLET
+        if (walletFrame)
+        {
+            walletFrame->setClientModel(nullptr);
+        }
+#endif // ENABLE_WALLET
+        unitDisplayControl->setOptionsModel(nullptr);
+    }
+}
+
+#ifdef ENABLE_WALLET
+bool VERGEGUI::addWallet(WalletModel *walletModel)
+{
+    if(!walletFrame)
+        return false;
+    const QString name = walletModel->getWalletName();
+    QString display_name = name.isEmpty() ? "["+tr("default wallet")+"]" : name;
+    setWalletActionsEnabled(true);
+    m_wallet_selector->addItem(display_name, name);
+    if (m_wallet_selector->count() == 2) {
+        m_wallet_selector_label = new QLabel();
+        m_wallet_selector_label->setText(tr("Wallet:") + " ");
+        m_wallet_selector_label->setBuddy(m_wallet_selector);
+        appToolBar->addWidget(m_wallet_selector_label);
+        appToolBar->addWidget(m_wallet_selector);
+        polishShellWidgets();
+    }
+    rpcConsole->addWallet(walletModel);
+    return walletFrame->addWallet(walletModel);
+}
+
+bool VERGEGUI::setCurrentWallet(const QString& name)
+{
+    if(!walletFrame)
+        return false;
+    return walletFrame->setCurrentWallet(name);
+}
+
+bool VERGEGUI::setCurrentWalletBySelectorIndex(int index)
+{
+    QString internal_name = m_wallet_selector->itemData(index).toString();
+    return setCurrentWallet(internal_name);
+}
+
+void VERGEGUI::removeAllWallets()
+{
+    if(!walletFrame)
+        return;
+    setWalletActionsEnabled(false);
+    walletFrame->removeAllWallets();
+}
+#endif // ENABLE_WALLET
+
+void VERGEGUI::setWalletActionsEnabled(bool enabled)
+{
+    overviewAction->setEnabled(enabled);
+    sendCoinsAction->setEnabled(enabled);
+    sendCoinsMenuAction->setEnabled(enabled);
+    receiveCoinsAction->setEnabled(enabled);
+    receiveCoinsMenuAction->setEnabled(enabled);
+    historyAction->setEnabled(enabled);
+    messagesAction->setEnabled(enabled);
+    tradeAction->setEnabled(enabled);
+    gamesAction->setEnabled(enabled);
+    encryptWalletAction->setEnabled(enabled);
+    backupWalletAction->setEnabled(enabled);
+    changePassphraseAction->setEnabled(enabled);
+    signMessageAction->setEnabled(enabled);
+    verifyMessageAction->setEnabled(enabled);
+    usedSendingAddressesAction->setEnabled(enabled);
+    usedReceivingAddressesAction->setEnabled(enabled);
+    usedChatAddressesAction->setEnabled(enabled);
+    openAction->setEnabled(enabled);
+}
+
+void VERGEGUI::createTrayIcon(const NetworkStyle *networkStyle)
+{
+#ifndef Q_OS_MAC
+    trayIcon = new QSystemTrayIcon(this);
+    QString toolTip = tr("%1 client").arg(tr(kGuiAppName)) + " " + networkStyle->getTitleAddText();
+    trayIcon->setToolTip(toolTip);
+    trayIcon->setIcon(networkStyle->getTrayAndWindowIcon());
+    trayIcon->hide();
+#endif
+
+    notificator = new Notificator(QApplication::applicationName(), trayIcon, this);
+}
+
+void VERGEGUI::createTrayIconMenu()
+{
+#ifndef Q_OS_MAC
+    // return if trayIcon is unset (only on non-Mac OSes)
+    if (!trayIcon)
+        return;
+
+    trayIconMenu = new QMenu(this);
+    trayIcon->setContextMenu(trayIconMenu);
+
+    connect(trayIcon, SIGNAL(activated(QSystemTrayIcon::ActivationReason)),
+            this, SLOT(trayIconActivated(QSystemTrayIcon::ActivationReason)));
+#else
+    // Note: On Mac, the dock icon is used to provide the tray's functionality.
+    MacDockIconHandler *dockIconHandler = MacDockIconHandler::instance();
+    dockIconHandler->setMainWindow(static_cast<QMainWindow*>(this));
+    trayIconMenu = dockIconHandler->dockMenu();
+#endif
+
+    // Configuration of the tray icon (or dock icon) icon menu
+    trayIconMenu->addAction(toggleHideAction);
+    trayIconMenu->addSeparator();
+    trayIconMenu->addAction(sendCoinsMenuAction);
+    trayIconMenu->addAction(receiveCoinsMenuAction);
+    trayIconMenu->addSeparator();
+    trayIconMenu->addAction(signMessageAction);
+    trayIconMenu->addAction(verifyMessageAction);
+    trayIconMenu->addSeparator();
+    trayIconMenu->addAction(optionsAction);
+    trayIconMenu->addAction(openRPCConsoleAction);
+#ifndef Q_OS_MAC // This is built-in on Mac
+    trayIconMenu->addSeparator();
+    trayIconMenu->addAction(quitAction);
+#endif
+}
+
+#ifndef Q_OS_MAC
+void VERGEGUI::trayIconActivated(QSystemTrayIcon::ActivationReason reason)
+{
+    if(reason == QSystemTrayIcon::Trigger)
+    {
+        // Click on system tray icon triggers show/hide of the main window
+        toggleHidden();
+    }
+}
+#endif
+
+void VERGEGUI::optionsClicked()
+{
+    if(!clientModel || !clientModel->getOptionsModel())
+        return;
+
+    OptionsDialog dlg(this, enableWallet);
+    dlg.setModel(clientModel->getOptionsModel());
+    dlg.exec();
+}
+
+void VERGEGUI::aboutClicked()
+{
+    if(!clientModel)
+        return;
+
+    HelpMessageDialog dlg(m_node, this, true);
+    dlg.exec();
+}
+
+void VERGEGUI::aboutQtClicked()
+{
+    QDialog dlg(this);
+    dlg.setObjectName("AboutQtDialog");
+    dlg.setWindowTitle(tr("About Qt"));
+
+    auto* layout = new QVBoxLayout(&dlg);
+    layout->setContentsMargins(24, 24, 24, 18);
+    layout->setSpacing(14);
+    layout->setSizeConstraint(QLayout::SetMinimumSize);
+
+    auto* label = new QLabel(
+        tr("<b>Qt</b> is a cross-platform C++ framework for application development.<br><br>"
+           "Runtime version: <b>%1</b>").arg(QString::fromLatin1(qVersion())),
+        &dlg);
+    label->setObjectName("AboutQtMessage");
+    label->setMinimumWidth(360);
+    label->setWordWrap(true);
+    label->setTextFormat(Qt::RichText);
+    layout->addWidget(label);
+
+    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok, &dlg);
+    buttons->setObjectName("AboutQtButtons");
+    connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+    layout->addWidget(buttons);
+
+    GUIUtil::EnableThemedDialogChrome(&dlg);
+    dlg.adjustSize();
+    dlg.resize(dlg.sizeHint().expandedTo(QSize(460, 248)));
+    dlg.exec();
+}
+
+void VERGEGUI::showDebugWindow()
+{
+    const QRect referenceRect = normalGeometry().isValid() ? normalGeometry() : geometry();
+    QScreen* targetScreen = QGuiApplication::screenAt(referenceRect.center());
+    if (!targetScreen) {
+        targetScreen = QGuiApplication::primaryScreen();
+    }
+
+    QRect available = referenceRect;
+    if (targetScreen) {
+        available = targetScreen->availableGeometry();
+    }
+
+    int targetWidth = qRound(referenceRect.width() * 0.94);
+    int targetHeight = qRound(referenceRect.height() * 0.94);
+
+    targetWidth = qBound(920, targetWidth, qMax(920, available.width() - 40));
+    targetHeight = qBound(620, targetHeight, qMax(620, available.height() - 40));
+
+    QRect targetRect(0, 0, targetWidth, targetHeight);
+    targetRect.moveCenter(referenceRect.center());
+
+    const int horizontalMargin = 20;
+    const int verticalMargin = 20;
+    if (targetRect.left() < available.left() + horizontalMargin) {
+        targetRect.moveLeft(available.left() + horizontalMargin);
+    }
+    if (targetRect.top() < available.top() + verticalMargin) {
+        targetRect.moveTop(available.top() + verticalMargin);
+    }
+    if (targetRect.right() > available.right() - horizontalMargin) {
+        targetRect.moveRight(available.right() - horizontalMargin);
+    }
+    if (targetRect.bottom() > available.bottom() - verticalMargin) {
+        targetRect.moveBottom(available.bottom() - verticalMargin);
+    }
+
+    rpcConsole->setWindowState(rpcConsole->windowState() & ~(Qt::WindowMaximized | Qt::WindowFullScreen));
+    rpcConsole->resize(targetRect.size());
+    rpcConsole->move(targetRect.topLeft());
+    rpcConsole->show();
+    rpcConsole->raise();
+    rpcConsole->activateWindow();
+}
+
+void VERGEGUI::showDebugWindowActivateConsole()
+{
+    rpcConsole->setTabFocus(RPCConsole::TAB_CONSOLE);
+    showDebugWindow();
+}
+
+void VERGEGUI::showDebugWindowActivatePeers()
+{
+    rpcConsole->setTabFocus(RPCConsole::TAB_PEERS);
+    showDebugWindow();
+}
+
+void VERGEGUI::showHelpMessageClicked()
+{
+    helpMessageDialog->show();
+}
+
+#ifdef ENABLE_WALLET
+void VERGEGUI::openClicked()
+{
+    OpenURIDialog dlg(this);
+    if(dlg.exec())
+    {
+        Q_EMIT receivedURI(dlg.getURI());
+    }
+}
+
+void VERGEGUI::gotoOverviewPage()
+{
+    overviewAction->setChecked(true);
+    if (walletFrame) walletFrame->gotoOverviewPage();
+}
+
+void VERGEGUI::gotoHistoryPage()
+{
+    historyAction->setChecked(true);
+    if (walletFrame) walletFrame->gotoHistoryPage();
+}
+
+void VERGEGUI::gotoReceiveCoinsPage()
+{
+    receiveCoinsAction->setChecked(true);
+    if (walletFrame) walletFrame->gotoReceiveCoinsPage();
+}
+
+void VERGEGUI::gotoSendCoinsPage(QString addr)
+{
+    sendCoinsAction->setChecked(true);
+    if (walletFrame) walletFrame->gotoSendCoinsPage(addr);
+}
+
+void VERGEGUI::gotoSendCoinsPage()
+{
+    gotoSendCoinsPage(QString());
+}
+
+void VERGEGUI::gotoMessagesPage()
+{
+    messagesAction->setChecked(true);
+    if (walletFrame) walletFrame->gotoMessagesPage();
+}
+
+void VERGEGUI::gotoTradePage()
+{
+    tradeAction->setChecked(true);
+    if (walletFrame) walletFrame->gotoTradePage();
+}
+
+void VERGEGUI::gotoGamesPage()
+{
+    gamesAction->setChecked(true);
+    if (walletFrame) walletFrame->gotoGamesPage();
+}
+
+void VERGEGUI::gotoSignMessageTab(QString addr)
+{
+    if (walletFrame) walletFrame->gotoSignMessageTab(addr);
+}
+
+void VERGEGUI::gotoSignMessageTab()
+{
+    gotoSignMessageTab(QString());
+}
+
+void VERGEGUI::gotoVerifyMessageTab(QString addr)
+{
+    if (walletFrame) walletFrame->gotoVerifyMessageTab(addr);
+}
+
+void VERGEGUI::gotoVerifyMessageTab()
+{
+    gotoVerifyMessageTab(QString());
+}
+#endif // ENABLE_WALLET
+
+void VERGEGUI::updateNetworkState()
+{
+    int count = clientModel->getNumConnections();
+    QString statusText;
+    QString networkState = "warming";
+    QString tooltip;
+    QColor signalColor(255, 120, 227);
+    QColor signalIdleColor(255, 120, 227, 56);
+    int litBars = 0;
+
+    if (m_node.getNetworkActive()) {
+        tooltip = tr("%n active connection(s) to VERGE network", "", count) + QString(".<br>") + tr("Click to disable network activity.");
+        if (count == 0) {
+            statusText = tr("Searching");
+        } else if (count == 1) {
+            statusText = tr("1 peer");
+            networkState = "live";
+        } else {
+            statusText = tr("%1 peers").arg(count);
+            networkState = "live";
+        }
+        litBars = ConnectionSignalBarsForPeerCount(count);
+        if (count > 0) {
+            signalColor = QColor(118, 236, 255);
+            signalIdleColor = QColor(118, 236, 255, 52);
+        }
+    } else {
+        tooltip = tr("Network activity disabled.") + QString("<br>") + tr("Click to enable network activity again.");
+        statusText = tr("Offline");
+        networkState = "offline";
+        signalColor = QColor(255, 106, 174);
+        signalIdleColor = QColor(255, 106, 174, 48);
+    }
+
+    // Don't word-wrap this (fixed-width) tooltip
+    tooltip = QString("<nobr>") + tooltip + QString("</nobr>");
+    connectionsControl->setToolTip(tooltip);
+    connectionsControl->setPixmap(CreateConnectionSignalBarsPixmap(litBars, signalColor, signalIdleColor));
+    if (networkStatusLabel) {
+        networkStatusLabel->setText(statusText);
+    }
+    if (networkStatusChip) {
+        networkStatusChip->setProperty("networkState", networkState);
+        RefreshWidgetStyle(networkStatusChip);
+    }
+    updateSmsgStatusIcon();
+}
+
+void VERGEGUI::updateSmsgStatusIcon()
+{
+    if (!labelSmsgIcon) {
+        return;
+    }
+
+    if (!clientModel) {
+        labelSmsgIcon->setPixmap(CreateChatBubblePixmap(QColor(255, 86, 113)));
+        labelSmsgIcon->setToolTip(tr("Secure messaging relay is not ready.<br>The blockchain is still loading."));
+        return;
+    }
+
+    interfaces::Node::NodesStats nodeStats;
+    bool hasSmsgPeer = false;
+    int smsgPeerCount = 0;
+    int advertisedSmsgPeerCount = 0;
+    int pendingSmsgPeerCount = 0;
+    if (m_node.getNetworkActive() && m_node.getNodesStats(nodeStats)) {
+        for (const auto& nodeStat : nodeStats) {
+            const CNodeStats& stats = std::get<0>(nodeStat);
+            if ((stats.nServices & NODE_SMSG) && !stats.fDisconnect) {
+                ++advertisedSmsgPeerCount;
+            }
+            if (IsCountableSmsgPeer(stats)) {
+                hasSmsgPeer = true;
+                ++smsgPeerCount;
+            }
+        }
+    }
+    pendingSmsgPeerCount = std::max(0, advertisedSmsgPeerCount - smsgPeerCount);
+
+    const int64_t lastBlockTime = m_node.getLastBlockTime();
+    const bool blockchainReady = !m_node.isInitialBlockDownload() &&
+        lastBlockTime > 0 &&
+        GetTime() - lastBlockTime < 90 * 60;
+    const QColor color = hasSmsgPeer ? QColor(82, 225, 116) : QColor(255, 86, 113);
+    labelSmsgIcon->setPixmap(CreateChatBubblePixmap(color));
+
+    QString tooltip;
+    if (hasSmsgPeer) {
+        tooltip = tr("Secure messaging relay is ready.");
+    } else if (!m_node.getNetworkActive()) {
+        tooltip = tr("Secure messaging relay is not ready.<br>Network activity is disabled.");
+    } else if (!blockchainReady) {
+        tooltip = tr("Secure messaging relay is not ready.<br>The blockchain is still syncing, so messages cannot be sent or received yet.");
+    } else if (advertisedSmsgPeerCount > 0) {
+        tooltip = tr("Secure messaging relay is not ready.<br>Connected SMSG peers are still being validated.");
+    } else {
+        tooltip = tr("Secure messaging relay is not ready.<br>No connected peer currently supports secure messaging.");
+    }
+
+    labelSmsgIcon->setToolTip(tooltip +
+        tr("<br>Validated SMSG peers: %1<br>Pending SMSG peers: %2<br>Total peers: %3")
+            .arg(smsgPeerCount)
+            .arg(pendingSmsgPeerCount)
+            .arg(nodeStats.size()));
+}
+
+void VERGEGUI::setNumConnections(int count)
+{
+    updateNetworkState();
+}
+
+void VERGEGUI::setNetworkActive(bool networkActive)
+{
+    updateNetworkState();
+}
+
+void VERGEGUI::updateHeadersSyncProgressLabel()
+{
+    int64_t headersTipTime = clientModel->getHeaderTipTime();
+    int headersTipHeight = clientModel->getHeaderTipHeight();
+    int estHeadersLeft = (GetTime() - headersTipTime) / CalculateAvgBlockTimeForHeight(headersTipHeight); //Params().GetConsensus().nPowTargetSpacing;
+    const int headerTarget = headersTipHeight + estHeadersLeft;
+    if (estHeadersLeft > HEADER_HEIGHT_DELTA_SYNC && headerTarget > 0) {
+        progressBarLabel->setText(tr("Syncing Headers (%1%)...").arg(QString::number(100.0 / headerTarget * headersTipHeight, 'f', 1)));
+        progressBar->setMaximum(1000000000);
+        progressBar->setValue((1000000000.0 / headerTarget * headersTipHeight) + 0.5);
+        progressBar->setFormat(tr("Header sync"));
+    }
+}
+
+void VERGEGUI::updateSyncProgressBarStyle()
+{
+    const double center = static_cast<double>(m_syncProgressBarOffset) / 100.0;
+    const double leftFade = qMax(0.0, center - 0.13);
+    const double rightFade = qMin(1.0, center + 0.13);
+    progressBar->setStyleSheet(QString(
+        "QProgressBar#SyncStatusProgress {"
+        " background-color: #13091f;"
+        " border: 1px solid #6d31a3;"
+        " border-radius: 9px;"
+        " padding: 1px;"
+        " min-height: 18px;"
+        " text-align: center;"
+        " color: #fff6ff;"
+        " font-weight: 600;"
+        "}"
+        "QProgressBar#SyncStatusProgress::chunk {"
+        " background: QLinearGradient(x1: 0, y1: 0, x2: 1, y2: 0,"
+        " stop: 0.00 #ffb6f4,"
+        " stop: %1 #ff70dc,"
+        " stop: %2 #9f54ff,"
+        " stop: %3 #79eeff,"
+        " stop: 1.00 #ffb6f4);"
+          " border-radius: 8px;"
+          " margin: 0px;"
+          "}").arg(leftFade, 0, 'f', 2).arg(center, 0, 'f', 2).arg(rightFade, 0, 'f', 2));
+}
+
+void VERGEGUI::updateSyncSpinnerIcon()
+{
+    if (!labelBlocksIcon) {
+        return;
+    }
+
+    labelBlocksIcon->setPixmap(CreateSyncSpinnerPixmap(
+        spinnerFrame,
+        QColor(122, 238, 255),
+        QColor(116, 52, 168)));
+}
+
+void VERGEGUI::setNumBlocks(int count, const QDateTime& blockDate, double nVerificationProgress, bool header)
+{
+    if (modalOverlay)
+    {
+        if (header)
+            modalOverlay->setKnownBestHeight(count, blockDate);
+        else
+            modalOverlay->tipUpdate(count, blockDate, nVerificationProgress);
+    }
+    if (!clientModel)
+        return;
+
+    // Prevent orphan statusbar messages (e.g. hover Quit in main menu, wait until chain-sync starts -> garbled text)
+    statusBar()->clearMessage();
+
+    // Acquire current block source
+    enum BlockSource blockSource = clientModel->getBlockSource();
+    QString syncState = "connecting";
+    QString chainStateText = tr("Connecting");
+    switch (blockSource) {
+        case BlockSource::NETWORK:
+            if (header) {
+                updateHeadersSyncProgressLabel();
+                syncState = "syncing";
+                chainStateText = tr("Headers");
+                progressBarLabel->setVisible(true);
+                progressBar->setVisible(true);
+                syncStatusCard->setVisible(true);
+                if (chainStatusLabel) {
+                    chainStatusLabel->setText(chainStateText);
+                }
+                if (chainStatusChip) {
+                    chainStatusChip->setProperty("syncState", syncState);
+                    RefreshWidgetStyle(chainStatusChip);
+                }
+                if (syncStatusCard) {
+                    syncStatusCard->setProperty("syncState", syncState);
+                    RefreshWidgetStyle(syncStatusCard);
+                }
+                return;
+            }
+            progressBarLabel->setText(tr("Synchronizing with network..."));
+            updateHeadersSyncProgressLabel();
+            syncState = "syncing";
+            chainStateText = tr("Syncing");
+            break;
+        case BlockSource::DISK:
+            if (header) {
+                progressBarLabel->setText(tr("Indexing blocks on disk..."));
+                chainStateText = tr("Indexing");
+            } else {
+                progressBarLabel->setText(tr("Processing blocks on disk..."));
+                chainStateText = tr("Processing");
+            }
+            syncState = "syncing";
+            break;
+        case BlockSource::REINDEX:
+            progressBarLabel->setText(tr("Reindexing blocks on disk..."));
+            syncState = "syncing";
+            chainStateText = tr("Reindexing");
+            break;
+        case BlockSource::NONE:
+            if (header) {
+                return;
+            }
+            progressBarLabel->setText(tr("Syncing Blockchain..."));
+            syncState = "connecting";
+            chainStateText = tr("Connecting");
+            break;
+    }
+
+    QString tooltip;
+
+    QDateTime currentDate = QDateTime::currentDateTime();
+    qint64 secs = blockDate.secsTo(currentDate);
+
+    tooltip = tr("Processed %n block(s) of transaction history.", "", count);
+
+    // Set icon state: spinning if catching up, tick otherwise
+    if(secs < 90*60)
+    {
+        tooltip = tr("Up to date") + QString(".<br>") + tooltip;
+        labelBlocksIcon->setPixmap(CreateSyncedCheckPixmap(QColor(82, 225, 116)));
+        syncState = "synced";
+        chainStateText = tr("Synced");
+
+#ifdef ENABLE_WALLET
+        if(walletFrame)
+        {
+            walletFrame->showOutOfSyncWarning(false);
+            modalOverlay->showHide(true, true);
+        }
+#endif // ENABLE_WALLET
+
+        progressBarLabel->setVisible(false);
+        progressBar->setVisible(false);
+        syncStatusCard->setVisible(false);
+    }
+    else
+    {
+        QString timeBehindText = GUIUtil::formatNiceTimeOffset(secs);
+
+        progressBarLabel->setVisible(true);
+        progressBar->setFormat(tr("%1 behind").arg(timeBehindText));
+        progressBar->setMaximum(1000000000);
+        progressBar->setValue(nVerificationProgress * 1000000000.0 + 0.5);
+        progressBar->setVisible(true);
+        if (!syncStatusCard->isVisible()) {
+            syncStatusCard->setVisible(true);
+            AnimateWidgetOpacity(syncStatusCard, 180);
+        } else {
+            syncStatusCard->setVisible(true);
+        }
+
+        tooltip = tr("Catching up...") + QString("<br>") + tooltip;
+        if (isVisible()) {
+            updateSyncSpinnerIcon();
+        }
+
+#ifdef ENABLE_WALLET
+        if(walletFrame)
+        {
+            walletFrame->showOutOfSyncWarning(true);
+            modalOverlay->showHide();
+        }
+#endif // ENABLE_WALLET
+
+        tooltip += QString("<br>");
+        tooltip += tr("Last received block was generated %1 ago.").arg(timeBehindText);
+        tooltip += QString("<br>");
+        tooltip += tr("Transactions after this will not yet be visible.");
+    }
+
+    if (chainStatusLabel) {
+        chainStatusLabel->setText(chainStateText);
+    }
+    if (chainStatusChip) {
+        chainStatusChip->setProperty("syncState", syncState);
+        RefreshWidgetStyle(chainStatusChip);
+    }
+    if (syncStatusCard) {
+        syncStatusCard->setProperty("syncState", syncState);
+        RefreshWidgetStyle(syncStatusCard);
+    }
+
+    // Don't word-wrap this (fixed-width) tooltip
+    tooltip = QString("<nobr>") + tooltip + QString("</nobr>");
+
+    labelBlocksIcon->setToolTip(tooltip);
+    progressBarLabel->setToolTip(tooltip);
+    progressBar->setToolTip(tooltip);
+}
+
+void VERGEGUI::message(const QString &title, const QString &message, unsigned int style, bool *ret)
+{
+    QString strTitle = tr("Verge"); // default title
+    // Default to information icon
+    int nMBoxIcon = QMessageBox::Information;
+    int nNotifyIcon = Notificator::Information;
+
+    QString msgType;
+
+    // Prefer supplied title over style based title
+    if (!title.isEmpty()) {
+        msgType = title;
+    }
+    else {
+        switch (style) {
+        case CClientUIInterface::MSG_ERROR:
+            msgType = tr("Error");
+            break;
+        case CClientUIInterface::MSG_WARNING:
+            msgType = tr("Warning");
+            break;
+        case CClientUIInterface::MSG_INFORMATION:
+            msgType = tr("Information");
+            break;
+        default:
+            break;
+        }
+    }
+    // Append title to "VERGE - "
+    if (!msgType.isEmpty())
+        strTitle += " - " + msgType;
+
+    // Check for error/warning icon
+    if (style & CClientUIInterface::ICON_ERROR) {
+        nMBoxIcon = QMessageBox::Critical;
+        nNotifyIcon = Notificator::Critical;
+    }
+    else if (style & CClientUIInterface::ICON_WARNING) {
+        nMBoxIcon = QMessageBox::Warning;
+        nNotifyIcon = Notificator::Warning;
+    }
+
+    // Display message
+    if (style & CClientUIInterface::MODAL) {
+        // Check for buttons, use OK as default, if none was supplied
+        QMessageBox::StandardButton buttons;
+        if (!(buttons = (QMessageBox::StandardButton)(style & CClientUIInterface::BTN_MASK)))
+            buttons = QMessageBox::Ok;
+
+        showNormalIfMinimized();
+        QMessageBox mBox(static_cast<QMessageBox::Icon>(nMBoxIcon), strTitle, message, buttons, this);
+        mBox.setTextFormat(Qt::PlainText);
+        int r = mBox.exec();
+        if (ret != nullptr)
+            *ret = r == QMessageBox::Ok;
+    }
+    else
+        notificator->notify(static_cast<Notificator::Class>(nNotifyIcon), strTitle, message);
+}
+
+void VERGEGUI::changeEvent(QEvent *e)
+{
+    QMainWindow::changeEvent(e);
+#ifndef Q_OS_MAC // Ignored on Mac
+    if(e->type() == QEvent::WindowStateChange)
+    {
+        updateMainWindowChromeButtons();
+        if(clientModel && clientModel->getOptionsModel() && clientModel->getOptionsModel()->getMinimizeToTray())
+        {
+            QWindowStateChangeEvent *wsevt = static_cast<QWindowStateChangeEvent*>(e);
+            if(!(wsevt->oldState() & Qt::WindowMinimized) && isMinimized())
+            {
+                QTimer::singleShot(0, this, SLOT(hide()));
+                e->ignore();
+            }
+            else if((wsevt->oldState() & Qt::WindowMinimized) && !isMinimized())
+            {
+                QTimer::singleShot(0, this, SLOT(show()));
+                e->ignore();
+            }
+        }
+    }
+#endif
+}
+
+void VERGEGUI::closeEvent(QCloseEvent *event)
+{
+#ifndef Q_OS_MAC // Ignored on Mac
+    if(clientModel && clientModel->getOptionsModel())
+    {
+        if(!clientModel->getOptionsModel()->getMinimizeOnClose())
+        {
+            // close rpcConsole in case it was open to make some space for the shutdown window
+            rpcConsole->close();
+
+            QApplication::quit();
+        }
+        else
+        {
+            QMainWindow::showMinimized();
+            event->ignore();
+        }
+    }
+#else
+    QMainWindow::closeEvent(event);
+#endif
+}
+
+void VERGEGUI::showEvent(QShowEvent *event)
+{
+    QMainWindow::showEvent(event);
+    if (m_syncProgressBarTimer && !m_syncProgressBarTimer->isActive()) {
+        QTimer::singleShot(1500, this, [this]() {
+            if (!isVisible() || !m_syncProgressBarTimer || m_syncProgressBarTimer->isActive()) {
+                return;
+            }
+            m_syncProgressBarTimer->start();
+            if (progressBar && progressBar->isVisible()) {
+                updateSyncSpinnerIcon();
+            }
+        });
+    }
+    // enable the debug window when the main window shows up
+    openRPCConsoleAction->setEnabled(true);
+    aboutAction->setEnabled(true);
+    optionsAction->setEnabled(true);
+    polishShellWidgets();
+    if (!m_hasAnimatedShell) {
+        m_hasAnimatedShell = true;
+        AnimateWidgetOpacity(appToolBar, 220);
+        AnimateWidgetOpacity(statusBar(), 280);
+    }
+}
+
+#ifdef ENABLE_WALLET
+void VERGEGUI::incomingTransaction(const QString& date, int unit, const CAmount& amount, const QString& type, const QString& address, const QString& label, const QString& walletName)
+{
+    // On new transaction, make an info balloon
+    QString msg = tr("Date: %1\n").arg(date) +
+                  tr("Amount: %1\n").arg(VERGEUnits::formatWithUnit(unit, amount, true));
+    if (m_node.getWallets().size() > 1 && !walletName.isEmpty()) {
+        msg += tr("Wallet: %1\n").arg(walletName);
+    }
+    msg += tr("Type: %1\n").arg(type);
+    if (!label.isEmpty())
+        msg += tr("Label: %1\n").arg(label);
+    else if (!address.isEmpty())
+        msg += tr("Address: %1\n").arg(address);
+    message((amount)<0 ? tr("Sent transaction") : tr("Incoming transaction"),
+             msg, CClientUIInterface::MSG_INFORMATION);
+}
+#endif // ENABLE_WALLET
+
+void VERGEGUI::dragEnterEvent(QDragEnterEvent *event)
+{
+    // Accept only URIs
+    if(event->mimeData()->hasUrls())
+        event->acceptProposedAction();
+}
+
+void VERGEGUI::dropEvent(QDropEvent *event)
+{
+    if(event->mimeData()->hasUrls())
+    {
+        for (const QUrl &uri : event->mimeData()->urls())
+        {
+            Q_EMIT receivedURI(uri.toString());
+        }
+    }
+    event->acceptProposedAction();
+}
+
+bool VERGEGUI::eventFilter(QObject *object, QEvent *event)
+{
+#ifndef Q_OS_MAC
+    if (object == appMenuBar && event) {
+        switch (event->type()) {
+        case QEvent::MouseButtonPress: {
+            QMouseEvent* mouseEvent = static_cast<QMouseEvent*>(event);
+            if (!appMenuBar->actionAt(mouseEvent->pos()) && mouseEvent->button() == Qt::LeftButton && !isMaximized()) {
+                m_titleBarDragging = true;
+                m_titleBarDragOffset = mouseEvent->globalPos() - frameGeometry().topLeft();
+                return true;
+            }
+            if (!appMenuBar->actionAt(mouseEvent->pos()) && mouseEvent->button() == Qt::RightButton) {
+                QMenu menu(this);
+                QAction* minimizeAction = menu.addAction(tr("Minimize"));
+                QAction* maximizeAction = menu.addAction(isMaximized() ? tr("Restore") : tr("Maximize"));
+                menu.addSeparator();
+                QAction* closeAction = menu.addAction(tr("Close"));
+                QAction* chosen = menu.exec(mouseEvent->globalPos());
+                if (chosen == minimizeAction) showMinimized();
+                if (chosen == maximizeAction) isMaximized() ? showNormal() : showMaximized();
+                if (chosen == closeAction) close();
+                updateMainWindowChromeButtons();
+                return true;
+            }
+            break;
+        }
+        case QEvent::MouseMove: {
+            QMouseEvent* mouseEvent = static_cast<QMouseEvent*>(event);
+            if (m_titleBarDragging && (mouseEvent->buttons() & Qt::LeftButton)) {
+                move(mouseEvent->globalPos() - m_titleBarDragOffset);
+                return true;
+            }
+            break;
+        }
+        case QEvent::MouseButtonDblClick: {
+            QMouseEvent* mouseEvent = static_cast<QMouseEvent*>(event);
+            if (!appMenuBar->actionAt(mouseEvent->pos()) && mouseEvent->button() == Qt::LeftButton) {
+                isMaximized() ? showNormal() : showMaximized();
+                updateMainWindowChromeButtons();
+                return true;
+            }
+            break;
+        }
+        case QEvent::MouseButtonRelease:
+            m_titleBarDragging = false;
+            break;
+        default:
+            break;
+        }
+    }
+#endif
+
+    // Catch status tip events
+    if (event->type() == QEvent::StatusTip)
+    {
+        // Prevent adding text from setStatusTip(), if we currently use the status bar for displaying other stuff
+        if (progressBarLabel->isVisible() || progressBar->isVisible())
+            return true;
+    }
+    return QMainWindow::eventFilter(object, event);
+}
+
+void VERGEGUI::mousePressEvent(QMouseEvent* event)
+{
+    QMainWindow::mousePressEvent(event);
+}
+
+void VERGEGUI::mouseMoveEvent(QMouseEvent* event)
+{
+    QMainWindow::mouseMoveEvent(event);
+}
+
+void VERGEGUI::mouseReleaseEvent(QMouseEvent* event)
+{
+    m_titleBarDragging = false;
+    QMainWindow::mouseReleaseEvent(event);
+}
+
+void VERGEGUI::leaveEvent(QEvent* event)
+{
+    m_titleBarDragging = false;
+    QMainWindow::leaveEvent(event);
+}
+
+#ifdef ENABLE_WALLET
+bool VERGEGUI::handlePaymentRequest(const SendCoinsRecipient& recipient)
+{
+    // URI has to be valid
+    if (walletFrame && walletFrame->handlePaymentRequest(recipient))
+    {
+        showNormalIfMinimized();
+        gotoSendCoinsPage();
+        return true;
+    }
+    return false;
+}
+
+void VERGEGUI::setHDStatus(int hdEnabled)
+{
+    labelWalletHDStatusIcon->setPixmap(platformStyle->SingleColorIcon(hdEnabled ? ":/icons/hd_enabled" : ":/icons/hd_disabled").pixmap(STATUSBAR_ICONSIZE,STATUSBAR_ICONSIZE));
+    labelWalletHDStatusIcon->setToolTip(hdEnabled ? tr("HD key generation is <b>enabled</b>") : tr("HD key generation is <b>disabled</b>"));
+
+    // eventually disable the QLabel to set its opacity to 50% 
+    labelWalletHDStatusIcon->setEnabled(hdEnabled);
+}
+
+void VERGEGUI::setEncryptionStatus(int status)
+{
+    switch(status)
+    {
+    case WalletModel::Unencrypted:
+        labelWalletEncryptionIcon->hide();
+        encryptWalletAction->setChecked(false);
+        changePassphraseAction->setEnabled(false);
+        encryptWalletAction->setEnabled(true);
+        break;
+    case WalletModel::Unlocked:
+        labelWalletEncryptionIcon->show();
+        labelWalletEncryptionIcon->setPixmap(platformStyle->SingleColorIcon(":/icons/lock_open").pixmap(STATUSBAR_ICONSIZE,STATUSBAR_ICONSIZE));
+        labelWalletEncryptionIcon->setToolTip(tr("Wallet is <b>encrypted</b> and currently <b>unlocked</b>"));
+        encryptWalletAction->setChecked(true);
+        changePassphraseAction->setEnabled(true);
+        encryptWalletAction->setEnabled(false); // TODO: decrypt currently not supported
+        break;
+    case WalletModel::Locked:
+        labelWalletEncryptionIcon->show();
+        labelWalletEncryptionIcon->setPixmap(platformStyle->SingleColorIcon(":/icons/lock_closed").pixmap(STATUSBAR_ICONSIZE,STATUSBAR_ICONSIZE));
+        labelWalletEncryptionIcon->setToolTip(tr("Wallet is <b>encrypted</b> and currently <b>locked</b>"));
+        encryptWalletAction->setChecked(true);
+        changePassphraseAction->setEnabled(true);
+        encryptWalletAction->setEnabled(false); // TODO: decrypt currently not supported
+        break;
+    }
+}
+
+void VERGEGUI::updateWalletStatus()
+{
+    if (!walletFrame) {
+        return;
+    }
+    WalletView * const walletView = walletFrame->currentWalletView();
+    if (!walletView) {
+        return;
+    }
+    WalletModel * const walletModel = walletView->getWalletModel();
+    setEncryptionStatus(walletModel->getEncryptionStatus());
+    setHDStatus(walletModel->wallet().hdEnabled());
+}
+#endif // ENABLE_WALLET
+
+void VERGEGUI::updateProxyIcon()
+{
+    std::string ip_port;
+    bool proxy_enabled = clientModel->getProxyInfo(ip_port);
+    if (proxyStatusChip) {
+        proxyStatusChip->setVisible(proxy_enabled);
+    }
+
+    if (proxy_enabled) {
+#if QT_VERSION >= QT_VERSION_CHECK(5, 15, 0)
+        const bool has_proxy_icon = !labelProxyIcon->pixmap(Qt::ReturnByValue).isNull();
+#else
+        const bool has_proxy_icon = labelProxyIcon->pixmap() != nullptr;
+#endif
+        if (!has_proxy_icon) {
+            QString ip_port_q = QString::fromStdString(ip_port);
+            labelProxyIcon->setPixmap(platformStyle->SingleColorIcon(":/icons/proxy").pixmap(STATUSBAR_ICONSIZE, STATUSBAR_ICONSIZE));
+            labelProxyIcon->setToolTip(tr("Proxy is <b>enabled</b>: %1").arg(ip_port_q));
+        } else {
+            labelProxyIcon->show();
+        }
+    } else {
+        labelProxyIcon->hide();
+    }
+}
+
+void VERGEGUI::showNormalIfMinimized(bool fToggleHidden)
+{
+    if(!clientModel)
+        return;
+
+    // activateWindow() (sometimes) helps with keyboard focus on Windows
+    if (isHidden())
+    {
+        show();
+        activateWindow();
+    }
+    else if (isMinimized())
+    {
+        showNormal();
+        activateWindow();
+    }
+    else if (GUIUtil::isObscured(this))
+    {
+        raise();
+        activateWindow();
+    }
+    else if(fToggleHidden)
+        hide();
+}
+
+void VERGEGUI::toggleHidden()
+{
+    showNormalIfMinimized(true);
+}
+
+void VERGEGUI::detectShutdown()
+{
+    if (m_node.shutdownRequested())
+    {
+        if(rpcConsole)
+            rpcConsole->hide();
+        qApp->quit();
+    }
+}
+
+void VERGEGUI::showProgress(const QString &title, int nProgress)
+{
+    if (nProgress == 0)
+    {
+        progressDialog = new QProgressDialog(title, "", 0, 100);
+        progressDialog->setWindowModality(Qt::ApplicationModal);
+        progressDialog->setMinimumDuration(0);
+        progressDialog->setCancelButton(0);
+        progressDialog->setAutoClose(false);
+        progressDialog->setValue(0);
+    }
+    else if (nProgress == 100)
+    {
+        if (progressDialog)
+        {
+            progressDialog->close();
+            progressDialog->deleteLater();
+        }
+    }
+    else if (progressDialog)
+        progressDialog->setValue(nProgress);
+}
+
+void VERGEGUI::setTrayIconVisible(bool fHideTrayIcon)
+{
+    if (trayIcon)
+    {
+        trayIcon->setVisible(!fHideTrayIcon);
+    }
+}
+
+void VERGEGUI::showModalOverlay()
+{
+    if (modalOverlay && (progressBar->isVisible() || modalOverlay->isLayerVisible()))
+        modalOverlay->toggleVisibility();
+}
+
+static bool ThreadSafeMessageBox(VERGEGUI *gui, const std::string& message, const std::string& caption, unsigned int style)
+{
+    bool modal = (style & CClientUIInterface::MODAL);
+    // The SECURE flag has no effect in the Qt GUI.
+    // bool secure = (style & CClientUIInterface::SECURE);
+    style &= ~CClientUIInterface::SECURE;
+    bool ret = false;
+    // In case of modal message, use blocking connection to wait for user to click a button
+    QMetaObject::invokeMethod(gui, "message",
+                               modal ? GUIUtil::blockingGUIThreadConnection() : Qt::QueuedConnection,
+                               Q_ARG(QString, QString::fromStdString(caption)),
+                               Q_ARG(QString, QString::fromStdString(message)),
+                               Q_ARG(unsigned int, style),
+                               Q_ARG(bool*, &ret));
+    return ret;
+}
+
+void VERGEGUI::subscribeToCoreSignals()
+{
+    // Connect signals to client
+    m_handler_message_box = m_node.handleMessageBox(std::bind(ThreadSafeMessageBox, this, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3));
+    m_handler_question = m_node.handleQuestion(std::bind(ThreadSafeMessageBox, this, std::placeholders::_1, std::placeholders::_3, std::placeholders::_4));
+}
+
+void VERGEGUI::unsubscribeFromCoreSignals()
+{
+    // Disconnect signals from client
+    m_handler_message_box->disconnect();
+    m_handler_question->disconnect();
+}
+
+void VERGEGUI::toggleNetworkActive()
+{
+    m_node.setNetworkActive(!m_node.getNetworkActive());
+}
+
+UnitDisplayStatusBarControl::UnitDisplayStatusBarControl(const PlatformStyle *platformStyle) :
+    optionsModel(0),
+    menu(0)
+{
+    Q_UNUSED(platformStyle);
+    createContextMenu();
+    setToolTip(tr("Unit to show amounts in. Click to select another unit."));
+    QList<VERGEUnits::Unit> units = VERGEUnits::availableUnits();
+    int max_width = 0;
+    const QFontMetrics fm(font());
+    for (const VERGEUnits::Unit unit : units)
+    {
+        max_width = qMax(max_width, fm.horizontalAdvance(VERGEUnits::longName(unit)));
+    }
+    setMinimumSize(max_width, 0);
+    setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+}
+
+/** So that it responds to button clicks */
+void UnitDisplayStatusBarControl::mousePressEvent(QMouseEvent *event)
+{
+    onDisplayUnitsClicked(event->pos());
+}
+
+/** Creates context menu, its actions, and wires up all the relevant signals for mouse events. */
+void UnitDisplayStatusBarControl::createContextMenu()
+{
+    menu = new QMenu(this);
+    for (VERGEUnits::Unit u : VERGEUnits::availableUnits())
+    {
+        QAction *menuAction = new QAction(QString(VERGEUnits::longName(u)), this);
+        menuAction->setData(QVariant(u));
+        menu->addAction(menuAction);
+    }
+    connect(menu,SIGNAL(triggered(QAction*)),this,SLOT(onMenuSelection(QAction*)));
+}
+
+/** Lets the control know about the Options Model (and its signals) */
+void UnitDisplayStatusBarControl::setOptionsModel(OptionsModel *_optionsModel)
+{
+    if (_optionsModel)
+    {
+        this->optionsModel = _optionsModel;
+
+        // be aware of a display unit change reported by the OptionsModel object.
+        connect(_optionsModel,SIGNAL(displayUnitChanged(int)),this,SLOT(updateDisplayUnit(int)));
+
+        // initialize the display units label with the current value in the model.
+        updateDisplayUnit(_optionsModel->getDisplayUnit());
+    }
+}
+
+/** When Display Units are changed on OptionsModel it will refresh the display text of the control on the status bar */
+void UnitDisplayStatusBarControl::updateDisplayUnit(int newUnits)
+{
+    setText(VERGEUnits::longName(newUnits));
+}
+
+/** Shows context menu with Display Unit options by the mouse coordinates */
+void UnitDisplayStatusBarControl::onDisplayUnitsClicked(const QPoint& point)
+{
+    QPoint globalPos = mapToGlobal(point);
+    menu->exec(globalPos);
+}
+
+/** Tells underlying optionsModel to update its current display unit. */
+void UnitDisplayStatusBarControl::onMenuSelection(QAction* action)
+{
+    if (action)
+    {
+        optionsModel->setDisplayUnit(action->data());
+    }
+}
